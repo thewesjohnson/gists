@@ -1,6 +1,6 @@
 # MTP Throughput Regression on Apple Silicon (Metal)
 
-Qwen MTP models load and produce correct output but generate slower than their non-MTP counterparts on Apple Silicon (Metal backend). Draft tokens are proposed and accepted, but speculative decoding provides no net speedup — it actively degrades throughput at every MTP configuration. Higher draft ceilings make it progressively worse.
+Qwen MTP models load and produce correct output but generate slower than their non-MTP counterparts on Apple Silicon (Metal backend). Draft tokens are proposed and accepted, but speculative decoding provides no net speedup. It actively degrades throughput at every MTP configuration. Higher draft ceilings make it progressively worse.
 
 ## System
 
@@ -149,7 +149,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 # 2. MTP model with speculative decoding enabled
 llama-server -m Qwen3.5-9B-MTP-Q4_K_M.gguf -ngl 99 --port 8080 \
   --spec-type draft-mtp --spec-draft-n-max 6
-# Same curl — compare tok/s and draft acceptance
+# Same curl. Compare tok/s and draft acceptance
 
 # 3. Vary --spec-draft-n-max: 0, 2, 6
 # Observe: higher ceiling = lower tok/s, lower acceptance
@@ -157,7 +157,7 @@ llama-server -m Qwen3.5-9B-MTP-Q4_K_M.gguf -ngl 99 --port 8080 \
 
 ## Related Issues
 
-- ggml-org/llama.cpp: [#23533](https://github.com/ggml-org/llama.cpp/issues/23533) (SYCL no speedup), [#23203](https://github.com/ggml-org/llama.cpp/issues/23203) (SYCL slowdown) — different backends, same symptom class
-- lmstudio-ai/lmstudio-bug-tracker: [#1941](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1941), [#1948](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1948), [#1951](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1951) — MTP load failures, different symptom
+- ggml-org/llama.cpp: [#23533](https://github.com/ggml-org/llama.cpp/issues/23533) (SYCL no speedup), [#23203](https://github.com/ggml-org/llama.cpp/issues/23203) (SYCL slowdown). Different backends, same symptom class
+- lmstudio-ai/lmstudio-bug-tracker: [#1941](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1941), [#1948](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1948), [#1951](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1951). MTP load failures, different symptom
 
 No existing report of MTP throughput regression on Metal/Apple Silicon.
