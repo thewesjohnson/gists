@@ -1,6 +1,6 @@
 # MTP Throughput Regression on Apple Silicon (Metal)
 
-Qwen MTP models load and produce correct output but generate slower than their non-MTP counterparts on Apple Silicon. Draft tokens are detected but speculative decoding provides no speedup — it actively degrades throughput. Higher MTP draft ceilings make it progressively worse.
+Qwen MTP models load and produce correct output but generate slower than their non-MTP counterparts on Apple Silicon (Metal backend). Draft tokens are proposed and accepted, but speculative decoding provides no net speedup — it actively degrades throughput at every MTP configuration. Higher draft ceilings make it progressively worse.
 
 ## System
 
@@ -29,16 +29,32 @@ Qwen MTP models load and produce correct output but generate slower than their n
 | Qwen3.6-35B-A3B | GGUF | Q4_K_M | 20.56 GiB | Qwen/Qwen3.6-35B-A3B-GGUF |
 | Qwen3.6-35B-A3B-MTP | GGUF | Q4_K_XL | 24.64 GiB | unsloth/Qwen3.6-35B-A3B-MTP-GGUF |
 
-## Test Conditions
+## Test 1: llama-server Draft Ceiling Sweep (Qwen3.5-9B-MTP, 2048 tokens)
 
-- Each model loaded individually (full unload between models)
-- Memory settled (swap < 500MB) before each load
-- Prompt: "What is 17 multiplied by 23? Give just the number."
-- temperature=0, max_tokens=1024
-- Thinking ON = default; Thinking OFF = assistant prefill `<think>\n\n</think>\n`
-- MTP min/max configured via LM Studio UI, model reloaded between changes
+Prompt: "Write a detailed explanation of how neural network backpropagation works, including the chain rule, gradient descent, vanishing gradients, and practical techniques like batch normalization and skip connections. Include mathematical notation where appropriate."
 
-## Results: MTP Draft Ceiling Sweep (Qwen3.5-9B-MTP vs baseline)
+Each configuration launched as a fresh `llama-server` process. `--spec-type draft-mtp` with `--spec-draft-n-min` / `--spec-draft-n-max` to control floor/ceiling. temperature=0, max_tokens=2048.
+
+| Config | Think ON tok/s | Think OFF tok/s | Draft Accept (ON/OFF) |
+|--------|------:|-------:|:---:|
+| **Baseline (non-MTP)** | **25.3** | **25.1** | **—** |
+| MTP 0/0 | 22.4 | 22.1 | 100% / 100% |
+| MTP 0/2 | 21.9 | 21.3 | 76% / 73% |
+| MTP 0/6 | 19.3 | 18.3 | 44% / 41% |
+| MTP 2/2 | 22.6 | 22.1 | 76% / 73% |
+| MTP 2/6 | 19.5 | 18.4 | 44% / 41% |
+| MTP 6/6 | 19.1 | 18.2 | 44% / 41% |
+
+### Findings
+
+1. **MTP is a net loss at every configuration.** Even MTP 0/0 with 100% draft acceptance is 11% slower than the non-MTP baseline. Draft evaluation overhead on Metal exceeds any speculative gain.
+2. **Ceiling drives the regression, floor has no effect.** 0/6, 2/6, and 6/6 all produce ~19 tok/s. 0/2 and 2/2 both produce ~22 tok/s. Only `--spec-draft-n-max` matters.
+3. **More draft tokens = worse acceptance AND more overhead.** max=0: 100% accept, max=2: ~75%, max=6: ~43%. Each step costs throughput.
+4. **No MTP configuration beats the non-MTP baseline.**
+
+## Test 2: LM Studio MTP Sweep (Qwen3.5-9B-MTP, short prompt)
+
+MTP min/max set in LM Studio UI. Model reloaded between changes. Prompt: "What is 17 multiplied by 23? Give just the number." temperature=0, max_tokens=1024.
 
 | Model | MTP min/max | Think | Tokens | Time | tok/s |
 |-------|:-----------:|-------|-------:|-----:|------:|
@@ -57,14 +73,9 @@ Qwen MTP models load and produce correct output but generate slower than their n
 | qwen3.5-9b-mtp | 6/6 | ON | 287 ct | 12.6s | 22.8 |
 | qwen3.5-9b-mtp | 6/6 | OFF | 4 ct | 0.6s | 6.8 |
 
-### Findings
+Same ceiling-drives-regression pattern as llama-server. LM Studio compounds the problem further — think OFF throughput drops to 6-9 tok/s vs llama-server's 18-22 tok/s.
 
-1. **Ceiling drives the regression, floor has no effect.** 0/6, 2/6, and 6/6 all produce ~22.8 tok/s (think ON). 0/2 and 2/2 both produce 26.6 tok/s. The min parameter is irrelevant.
-2. **More draft tokens = slower.** max=0: 29.9 → max=2: 26.6 → max=6: 22.6 tok/s (think ON). Each increase in ceiling degrades throughput.
-3. **MTP 0/0 matches base on think ON** (29.9 vs 28.6) but is **30% slower on think OFF** (8.5 vs 12.0). Even with drafting effectively disabled, the MTP model has overhead.
-4. **No MTP configuration beats the non-MTP baseline** for think OFF throughput.
-
-## Results: 27-Model Automated Probe (default MTP settings)
+## Test 3: LM Studio 27-Model Automated Probe (default MTP settings)
 
 ### Qwen3.5-9B: MTP vs non-MTP
 
@@ -75,8 +86,6 @@ Qwen MTP models load and produce correct output but generate slower than their n
 | tool_use | 18.5 | 19.6 | 1.1x |
 | json_schema | 22.6 | 23.6 | 1.0x |
 | fim | 19.6 | 25.2 | 1.3x |
-
-Mild regression (~1.3x average).
 
 ### Qwen3.6-35B-A3B: MTP vs non-MTP
 
@@ -90,46 +99,65 @@ Mild regression (~1.3x average).
 | json_schema | 5.6 | 33.6 | **6x** |
 | fim | 5.7 | 39.4 | **7x** |
 
-Severe regression. The 35B MoE MTP variant is **5–14x slower** across all probe types.
+The 35B MoE MTP variant is **5–14x slower** across all probe types via LM Studio.
+
+## llama-server Logs
+
+### MTP Model Load + Speculative Init
+
+```
+llama_model_loader: - kv  32: qwen35.nextn_predict_layers u32 = 1
+create_tensor: loading tensor blk.32.nextn.eh_proj.weight
+create_tensor: loading tensor blk.32.nextn.enorm.weight
+create_tensor: loading tensor blk.32.nextn.hnorm.weight
+create_tensor: loading tensor blk.32.nextn.shared_head_norm.weight
+srv    load_model: [spec] adding 1808.02 MiB to fit_params_target for device MTL0
+srv    load_model: [spec] estimated memory usage of MTP context is 1808.02 MiB
+srv    load_model: creating MTP draft context against the target model
+common_speculative_impl_draft_mtp: adding speculative implementation 'draft-mtp'
+common_speculative_impl_draft_mtp: - n_max=3, n_min=0, p_min=0.00, n_embd=4096, backend_sampling=1
+common_speculative_impl_draft_mtp: - gpu_layers=-1, cache_k=f16, cache_v=f16, ctx_tgt=yes, ctx_dft=yes, devices=[default]
+srv    load_model: speculative decoding context initialized
+srv    load_model: context checkpoints enabled, max = 32, min spacing = 256
+```
+
+### Sample Inference Timings (271 tokens, `--spec-type draft-mtp`)
+
+```
+prompt eval time =     518.24 ms /    26 tokens (   19.93 ms per token,    50.17 tokens per second)
+       eval time =    7551.42 ms /   271 tokens (   27.87 ms per token,    35.89 tokens per second)
+      total time =    8069.66 ms /   297 tokens
+   graphs reused =         79
+draft acceptance = 0.80000 (  192 accepted /   240 generated)
+```
 
 ## Reproduction
 
 ```bash
-# Requires llama-server (homebrew llama.cpp b9330+) or LM Studio 0.4.14+
+# llama-server b9330+ required
 
-# 1. Load non-MTP baseline
-llama-server -m Qwen3.5-9B-Q4_K_M.gguf -ngl 99
-
-# Test with thinking ON (default)
+# 1. Baseline (non-MTP model)
+llama-server -m Qwen3.5-9B-Q4_K_M.gguf -ngl 99 --port 8080
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages":[{"role":"user","content":"What is 17 multiplied by 23? Give just the number."}],
-    "max_tokens":1024,
-    "temperature":0
+    "messages":[{"role":"user","content":"Write a detailed explanation of how neural network backpropagation works, including the chain rule, gradient descent, vanishing gradients, and practical techniques like batch normalization and skip connections."}],
+    "max_tokens":2048, "temperature":0
   }'
+# Note tok/s from response timings
 
-# Test with thinking OFF (assistant prefill)
-curl -s http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages":[
-      {"role":"user","content":"What is 17 multiplied by 23? Give just the number."},
-      {"role":"assistant","content":"<think>\n\n</think>\n","prefix":true}
-    ],
-    "max_tokens":1024,
-    "temperature":0
-  }'
+# 2. MTP model with speculative decoding enabled
+llama-server -m Qwen3.5-9B-MTP-Q4_K_M.gguf -ngl 99 --port 8080 \
+  --spec-type draft-mtp --spec-draft-n-max 6
+# Same curl — compare tok/s and draft acceptance
 
-# 2. Load MTP variant (with draft model support)
-llama-server -m Qwen3.5-9B-MTP-Q4_K_M.gguf -ngl 99
-
-# Same curl commands — compare tok/s in response usage field
+# 3. Vary --spec-draft-n-max: 0, 2, 6
+# Observe: higher ceiling = lower tok/s, lower acceptance
 ```
 
 ## Related Issues
 
-- ggml-org/llama.cpp: [#23533](https://github.com/ggml-org/llama.cpp/issues/23533) (SYCL no speedup), [#23203](https://github.com/ggml-org/llama.cpp/issues/23203) (SYCL slowdown)
-- lmstudio-ai/lmstudio-bug-tracker: [#1941](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1941), [#1948](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1948), [#1951](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1951) (MTP load failures — different symptom)
+- ggml-org/llama.cpp: [#23533](https://github.com/ggml-org/llama.cpp/issues/23533) (SYCL no speedup), [#23203](https://github.com/ggml-org/llama.cpp/issues/23203) (SYCL slowdown) — different backends, same symptom class
+- lmstudio-ai/lmstudio-bug-tracker: [#1941](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1941), [#1948](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1948), [#1951](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1951) — MTP load failures, different symptom
 
 No existing report of MTP throughput regression on Metal/Apple Silicon.
